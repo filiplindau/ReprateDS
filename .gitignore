@@ -1,0 +1,8 @@
+*.txt
+*.pyc
+.idea/
+.settings/
+*.png
+*.npy
+*.npz
+*.pkl
