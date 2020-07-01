@@ -252,6 +252,34 @@ class ReprateDS(Device):
                                 doc="RPi pin numbers of the 2 data bits for switches",
                                 default_value=[16, 29])
 
+    ref_std_table_r1 = device_property(dtype=str,
+                                       doc="Reference table for standard injection into R1",
+                                       update_db=True,
+                                       default_value="[[30, 160, 1]\n "
+                                                     "[18500, 161, 1]\n "
+                                                     "[3, 162, 0]\n "
+                                                     "[4, 163, 0]\n "
+                                                     "[5, 164, 0]\n "
+                                                     "[6, 165, 0]\n "
+                                                     "[7, 166, 0]\n "
+                                                     "[8, 167, 0]\n "
+                                                     "[9, 168, 0]\n "
+                                                     "[10, 169, 0]]")
+
+    ref_std_table_r3 = device_property(dtype=str,
+                                       doc="Reference table for standard injection into R3",
+                                       update_db=True,
+                                       default_value="[[136, 160, 1]\n "
+                                                     "[10000, 161, 1]\n "
+                                                     "[3, 164, 0]\n "
+                                                     "[4, 160, 0]\n "
+                                                     "[5, 161, 0]\n "
+                                                     "[6, 160, 0]\n "
+                                                     "[7, 161, 0]\n "
+                                                     "[8, 164, 0]\n "
+                                                     "[9, 160, 0]\n "
+                                                     "[10, 161, 0]]")
+
     def __init__(self, klass, name):
         self.evg_device_r1 = None
         self.evg_device_r3 = None
@@ -269,11 +297,22 @@ class ReprateDS(Device):
         self.event1_factor_r3_data = None
         self.current_ring_data = "R1"
 
+        self.status_r1_table = "standard"
+        self.status_r3_table = "standard"
+
         self.data_lock = threading.Lock()
 
         Device.__init__(self, klass, name)
 
     def init_device(self):
+        """
+        Init device:
+        Connect to EVG device servers and read their current injection tables.
+        Setup GPIO pins for switch control.
+
+        :return:
+        :rtype:
+        """
         self.debug_stream("In init_device:")
         Device.init_device(self)
 
@@ -296,13 +335,36 @@ class ReprateDS(Device):
         self.info_stream("Connected to EVG device {0}".format(self.evg_name_r3))
         self.set_state(pt.DevState.ON)
         self.set_status("Connected to devices {0}, {1}".format(self.evg_name_r1, self.evg_name_r3))
-        self.read_sequence_from_device2("r1")
-        self.read_sequence_from_device2("r3")
+        self.read_inj_table_from_device("r1")
+        self.read_inj_table_from_device("r3")
         gpio.setmode(gpio.BOARD)
         gpio.setup(self.data_pins[0], gpio.OUT)
         gpio.setup(self.data_pins[1], gpio.OUT)
 
+    def _gen_status(self):
+        """
+        Generate and set status string from current injection table and ring selections
+        :return:
+        :rtype:
+        """
+        s = "R1 table: {0}\n" \
+            "R3 table: {1}\n" \
+            "Target: {2}\n\n" \
+            "{3}".format(self.status_r1_table.upper(), self.status_r3_table.upper(),
+                         self.current_ring_data.upper(), self.state())
+        self.set_status(s)
+        return True
+
     def read_sequence_from_device(self):
+        """
+        Read injection table from EVG using the sequence property and timestamp, enable attributes.
+        Also stores this table in normal_sequence_xx_data for later write-back to device.
+
+        Not efficient. Use read_inj_table_from_device instead.
+
+        :return: Injection table
+        :rtype:
+        """
         if self.evg_device_r1 is not None:
             seq_prop = self.evg_device_r1.get_property("sequence")
             if not seq_prop["sequence"]:
@@ -339,7 +401,20 @@ class ReprateDS(Device):
                 raise e
             return inj_table
 
-    def read_sequence_from_device2(self, ring):
+    def read_inj_table_from_device(self, ring):
+        """
+        Read injection table from EVG using the injection_table_dump attribute.
+        Also stores this table in normal_sequence_xx_data for later write-back to device.
+
+        :param ring: Which ring to read from, r1 or r3
+        :type ring: str
+        :return: Injection table, list of lists:
+            [[timestamp0, event code0, enable0],
+             [timestamp1, event code1, enable1],
+             [timestamp2, event code2, enable2],
+             [timestamp3, event code3, enable3...]]
+        :rtype:
+        """
         if ring == "r1":
             if self.evg_device_r1 is not None:
                 try:
@@ -372,7 +447,20 @@ class ReprateDS(Device):
                 return None
         return inj_table
 
-    def generate_sequence(self, freq_list=[10, 2], ev_list=[0xa0, 0xa4]):
+    def generate_sequence_freq(self, freq_list=[10, 2], ev_list=[0xa0, 0xa4]):
+        """
+        Generate injection table from two frequencies and corresponding event codes.
+        :param freq_list: 2-element list of frequencies to use
+        :type freq_list: List
+        :param ev_list: 2-element list of event codes to use
+        :type ev_list: List
+        :return: Injection table, list of lists:
+            [[timestamp0, event code0, enable0],
+             [timestamp1, event code1, enable1],
+             [timestamp2, event code2, enable2],
+             [timestamp3, event code3, enable3...]]
+        :rtype:
+        """
         f = np.array(freq_list)
         max_f = f.max()
         ih = f.argmax()
@@ -398,13 +486,30 @@ class ReprateDS(Device):
         return inj_table
 
     def generate_sequence_factor(self, f0, factor, event0, event1):
+        """
+        Generate injection table from event0 (higher frequency) and a divider factor to get f1=f0/factor
+        :param f0: Event0 freuqency
+        :type f0: float
+        :param factor: Divider
+        :type factor: int
+        :param event0: Event code for f0 e.g. 0xa0
+        :type event0: int
+        :param event1: Event code for f1 e.g. 0xa4
+        :type event1: int
+        :return: Injection table, list of lists:
+            [[timestamp0, event code0, enable0],
+             [timestamp1, event code1, enable1],
+             [timestamp2, event code2, enable2],
+             [timestamp3, event code3, enable3...]]
+        :rtype: List of lists of int
+        """
         if f0 is None:
             f0 = 2.0
         if factor is None:
             factor = 1
         f1 = np.double(f0) / factor
-        t_mrf = self.t0
-        tp = 1 / f1 / t_mrf           # Full cycle period in clocks
+        t_mrf = self.t0                 # MRF clock period
+        tp = 1 / f1 / t_mrf             # Full cycle period in clocks
         ep = 0x7f                       # End sequence event code
         t0 = np.arange(factor) / f0 / t_mrf + 1
         t1 = np.arange(1) / f1 / t_mrf + 1
@@ -423,6 +528,23 @@ class ReprateDS(Device):
         return inj_table
 
     def write_sequence_to_device(self, inj_table, ring):
+        """
+        Write injection table sequence to a ring EVG. Timestamp data in clock cycles.
+
+        :param inj_table: Injection table to write, list of lists:
+            [[timestamp0, event code0, enable0],
+             [timestamp1, event code1, enable1],
+             [timestamp2, event code2, enable2],
+             [timestamp3, event code3, enable3...]]
+
+             Max 10 entries
+
+        :type inj_table: List of lists of ints
+        :param ring: Ring EVG selection, R1 or R3
+        :type ring: str
+        :return:
+        :rtype:
+        """
         self.info_stream("Writing injection table to device")
         self.debug_stream("{0}, len {1}".format(inj_table, len(inj_table)))
         # Extract data from table
@@ -438,7 +560,7 @@ class ReprateDS(Device):
         enable = enable[:attr_len]
 
         self.debug_stream("\nTimestamps: {0}\nEvents: {1}\nEnable: {2}".format(timestamp, event, enable))
-        if ring == "r1":
+        if ring.lower() == "r1":
             dev = self.evg_device_r1
         else:
             dev = self.evg_device_r3
@@ -494,6 +616,18 @@ class ReprateDS(Device):
         return True
 
     def find_common(self, f0, f1, n_max=100):
+        """
+        Find common divisors of two frequencies
+
+        :param f0:
+        :type f0:
+        :param f1:
+        :type f1:
+        :param n_max:
+        :type n_max:
+        :return:
+        :rtype:
+        """
         fh = float(max(f0, f1))
         fl = float(min(f0, f1))
         k = np.arange(1, n_max + 1, dtype=int)
@@ -511,6 +645,8 @@ class ReprateDS(Device):
 
     def find_primes(self, n):
         """
+        Find prime numbers in integer n.
+        For factorizing.
 
         :param n:
         :type n:
@@ -627,9 +763,13 @@ class ReprateDS(Device):
         else:
             return False
 
-    def get_injection_table(self):
-        print("inj tab:\n {0}".format(self.injection_table_r1_data))
-        return str(self.injection_table_r1_data)
+    def get_injection_table(self, ring):
+        if ring.lower() == "r1":
+            s = self.injection_table_r1_data
+        else:
+            s = self.injection_table_r3_data
+        self.info_stream("inj tab:\n {0}".format(s))
+        return str(s)
 
     def get_standard_table_r1(self):
         with self.data_lock:
@@ -659,12 +799,20 @@ class ReprateDS(Device):
         return f
 
     def set_event0_frequency_r1(self, value):
+        """
+        Set the event0 frequency for ring r1
+        :param value: frequency
+        :type value: float
+        :return:
+        :rtype:
+        """
         self.info_stream("Set event frequency R1: {0}".format(value))
         with self.data_lock:
             self.event0_frequency_r1_data = value
             inj_table = self.generate_sequence_factor(value, self.event1_factor_r1_data,
                                                       self.event0_code, self.event1_code)
             self.injection_table_r1_data = inj_table
+        self._gen_status()
         return True
 
     def is_event0_frequency_r1_allowed(self):
@@ -680,12 +828,20 @@ class ReprateDS(Device):
         return f
 
     def set_event0_frequency_r3(self, value):
+        """
+        Set the event0 frequency for ring r3
+        :param value: frequency
+        :type value: float
+        :return:
+        :rtype:
+        """
         self.info_stream("Set event frequency R3: {0}".format(value))
         with self.data_lock:
             self.event0_frequency_r3_data = value
             inj_table = self.generate_sequence_factor(value, self.event1_factor_r3_data,
                                                       self.event0_code, self.event1_code)
             self.injection_table_r3_data = inj_table
+        self._gen_status()
         return True
 
     def is_event0_frequency_r3_allowed(self):
@@ -695,18 +851,25 @@ class ReprateDS(Device):
             return False
 
     def get_event1_factor_r1(self):
-
         with self.data_lock:
             f = self.event1_factor_r1_data
         return f
 
     def set_event1_factor_r1(self, value):
+        """
+        Set the integer factor to divide R1 event0 frequency with to generate secondary frequency f1=f0/value
+        :param value: Divider
+        :type value: int
+        :return:
+        :rtype:
+        """
         self.info_stream("Set event factor R1: {0}".format(value))
         with self.data_lock:
             self.event1_factor_r1_data = value
             inj_table = self.generate_sequence_factor(self.event0_frequency_r1_data, value,
                                                       self.event0_code, self.event1_code)
             self.injection_table_r1_data = inj_table
+        self._gen_status()
         return True
 
     def is_event1_factor_r1_allowed(self):
@@ -721,12 +884,20 @@ class ReprateDS(Device):
         return f
 
     def set_event1_factor_r3(self, value):
+        """
+        Set the integer factor to divide R3 event0 frequency with to generate secondary frequency f1=f0/value
+        :param value: Divider
+        :type value: int
+        :return:
+        :rtype:
+        """
         self.info_stream("Set event factor R3: {0}".format(value))
         with self.data_lock:
             self.event1_factor_r3_data = value
             inj_table = self.generate_sequence_factor(self.event0_frequency_r3_data, value,
                                                       self.event0_code, self.event1_code)
             self.injection_table_r3_data = inj_table
+        self._gen_status()
         return True
 
     def is_event1_factor_r3_allowed(self):
@@ -740,48 +911,81 @@ class ReprateDS(Device):
             f = self.current_ring_data
         return f
 
-    @command(dtype_in=None)
-    def set_dual_reprate_table_r1(self):
-        inj_table = self.injection_table_r1_data
-        self.write_sequence_to_device(inj_table, "r1")
-        self.set_state(pt.DevState.RUNNING)
-        self.set_status("Using R1 dual reprate {0} + {1} Hz".format(self.event0_frequency_r1_data,
-                                                                    self.event0_frequency_r1_data / self.event1_factor_r1_data))
+    @command(dtype_in=None, doc_in="Set configured dual reprate table to EVG of ring R1")
+    def set_dual_reprate_table_to_r1(self):
+        if self.state() in [pt.DevState.ON, pt.DevState.RUNNING]:
+            inj_table = self.injection_table_r1_data
+            self.write_sequence_to_device(inj_table, "r1")
+            self.set_state(pt.DevState.RUNNING)
+            self.status_r1_table = "DUAL REPRATE {0} + {1} Hz".format(self.event0_frequency_r1_data,
+                                                                      self.event0_frequency_r1_data / self.event1_factor_r1_data)
+            self._gen_status()
 
-    @command(dtype_in=None)
-    def set_dual_reprate_table_r3(self):
-        inj_table = self.injection_table_r3_data
-        self.write_sequence_to_device(inj_table, "r3")
-        self.set_state(pt.DevState.RUNNING)
-        self.set_status("Using R3 dual reprate {0} + {1} Hz".format(self.event0_frequency_r3_data,
-                                                                    self.event0_frequency_r3_data / self.event1_factor_r3_data))
+    @command(dtype_in=None, doc_in="Set configured dual reprate table to EVG of ring R3")
+    def set_dual_reprate_table_to_r3(self):
+        if self.state() in [pt.DevState.ON, pt.DevState.RUNNING]:
+            inj_table = self.injection_table_r3_data
+            self.write_sequence_to_device(inj_table, "r3")
+            self.set_state(pt.DevState.RUNNING)
+            self.status_r3_table = "DUAL REPRATE {0} + {1} Hz".format(self.event0_frequency_r3_data,
+                                                                      self.event0_frequency_r3_data / self.event1_factor_r3_data)
+            self._gen_status()
 
-    @command(dtype_in=None)
-    def set_standard_table_r1(self):
-        inj_table = self.normal_sequence_r1_data
-        self.write_sequence_to_device(inj_table, "r1")
-        self.set_state(pt.DevState.RUNNING)
-        self.set_status("Using R1 standard injection table {0}".format(inj_table))
+    @command(dtype_in=None, doc_in="Set standard injection table (it was sampled at init of this device) to EVG of ring R1")
+    def set_current_std_table_to_r1(self):
+        if self.state() in [pt.DevState.ON, pt.DevState.RUNNING]:
+            inj_table = self.normal_sequence_r1_data
+            self.write_sequence_to_device(inj_table, "r1")
+            self.set_state(pt.DevState.RUNNING)
+            self.status_r3_table = "STANDARD"
+            self._gen_status()
 
-    @command(dtype_in=None)
-    def set_standard_table_r3(self):
-        inj_table = self.normal_sequence_r3_data
-        self.write_sequence_to_device(inj_table, "r3")
-        self.set_state(pt.DevState.RUNNING)
-        self.set_status("Using R3 standard injection table {0}".format(inj_table))
+    @command(dtype_in=None, doc_in="Set standard injection table (it was sampled at init of this device) to EVG of ring R3")
+    def set_current_std_table_to_r3(self):
+        if self.state() in [pt.DevState.ON, pt.DevState.RUNNING]:
+            inj_table = self.normal_sequence_r3_data
+            self.write_sequence_to_device(inj_table, "r3")
+            self.set_state(pt.DevState.RUNNING)
+            self.status_r3_table = "STANDARD"
+            self._gen_status()
 
-    @command(dtype_in=str)
-    def set_ring_target(self, ring="R1"):
-        self.set_state(pt.DevState.RUNNING)
-        with self.data_lock:
-            self.current_ring_data = ring
-            if ring == "R1":
-                gpio.output(self.data_pins[0], 1)
-                gpio.output(self.data_pins[1], 0)
-            else:
-                gpio.output(self.data_pins[0], 0)
-                gpio.output(self.data_pins[1], 1)
-        self.set_status("Setting current ring to {0}".format(ring))
+    @command(dtype_in=str, doc_in="Set which ring's EVG to use to trigger accelerator. R1 or R3.")
+    def set_ring_injection_target(self, ring="r1"):
+        if self.state() in [pt.DevState.ON, pt.DevState.RUNNING]:
+            with self.data_lock:
+                self.current_ring_data = ring
+                if ring.lower() == "r1":
+                    gpio.output(self.data_pins[0], 1)
+                    gpio.output(self.data_pins[1], 0)
+                else:
+                    gpio.output(self.data_pins[0], 0)
+                    gpio.output(self.data_pins[1], 1)
+            self.set_state(pt.DevState.RUNNING)
+            self._gen_status()
+
+    @command(dtype_in=None, doc_in="Store R1 standard injection table (it was sampled at init of this device) in property ref_std_table_r1")
+    def store_current_std_table_to_ref_r1(self):
+        s = str(self.normal_sequence_r1_data)
+        self.ref_std_table_r1 = s
+
+    @command(dtype_in=None, doc_in="Store R3 standard injection table (it was sampled at init of this device) in property ref_std_table_r3")
+    def store_current_std_table_to_ref_r3(self):
+        s = str(self.normal_sequence_r3_data)
+        self.ref_std_table_r3 = s
+
+    @command(dtype_in=None, doc_in="Set injection table stored in property ref_std_table_r1 to EVG of ring R1")
+    def set_ref_table_to_r1(self):
+        if self.state() in [pt.DevState.ON, pt.DevState.RUNNING]:
+            self.write_sequence_to_device(json.loads(self.ref_std_table_r1), "r1")
+            self.status_r1_table = "REFERENCE"
+            self._gen_status()
+
+    @command(dtype_in=None, doc_in="Set injection table stored in property ref_std_table_r3 to EVG of ring R3")
+    def set_ref_table_to_r3(self):
+        if self.state() in [pt.DevState.ON, pt.DevState.RUNNING]:
+            self.write_sequence_to_device(json.loads(self.ref_std_table_r3), "r3")
+            self.status_r3_table = "REFERENCE"
+            self._gen_status()
 
 
 if __name__ == "__main__":
