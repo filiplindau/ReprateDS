@@ -267,6 +267,11 @@ class ReprateDS(Device):
                                               "e.g. I-K00/TIM/EVR-01-R1/Output01Delay",
                                           default_value="I-K00/TIM/EVR-01-R1/Output01Delay")
 
+    diag_evr_name_r1 = device_property(dtype=str,
+                                       doc="Full Tango name for the R1 EVR attribute triggering the diagnostics,"
+                                           "e.g. I-K00/TIM/EVR-01-R1/Output05Delay",
+                                       default_value="I-K00/TIM/EVR-01-R1/Output05Delay")
+
     evg_name_r3 = device_property(dtype=str,
                                   doc="Device name of the EVG to be controlled for R3",)
 
@@ -279,6 +284,11 @@ class ReprateDS(Device):
                                           doc="Full Tango name for the EVR attribute triggering the chopper for R3,"
                                               "e.g. I-K00/TIM/EVR-01-R3/Output01Delay",
                                           default_value="I-K00/TIM/EVR-01-R3/Output01Delay")
+
+    diag_evr_name_r3 = device_property(dtype=str,
+                                       doc="Full Tango name for the R3 EVR attribute triggering the diagnostics,"
+                                           "e.g. I-K00/TIM/EVR-01-R3/Output05Delay",
+                                       default_value="I-K00/TIM/EVR-01-R3/Output05Delay")
 
     n_max = device_property(dtype=int,
                             doc="Number of entries available in the injection table",
@@ -295,16 +305,6 @@ class ReprateDS(Device):
     event1_code = device_property(dtype=int,
                                   doc="Event1 code transmitted by the MRF EVG",
                                   default_value=0xa4)
-
-    event2_code = device_property(dtype=int,
-                                  doc="Event2 code transmitted by the MRF EVG. This event is sent event2_offset clock"
-                                      "cycles (~100 ns period) before event 1. The purpose is to trigger libera boxes",
-                                  default_value=0xa5)
-
-    event2_offset = device_property(dtype=int,
-                                    doc="Event2 time offset to event1 in clock cycles (100 ns period). "
-                                        "Negative value for arrival before the event0 event.",
-                                    default_value=-500)
 
     data_pins = device_property(dtype=pt.DevVarShortArray,
                                 doc="RPi pin numbers of the 2 data bits for switches (board number, not BCM name)",
@@ -444,16 +444,12 @@ class ReprateDS(Device):
 
         self.standard_table_r1_data = self.read_inj_table_from_device("r1")
         self.standard_table_r3_data = self.read_inj_table_from_device("r3")
-        self.dual_reprate_table_r1_data = self.generate_sequence_factor_secondary_event(self.event0_frequency_r1_data,
-                                                                                        self.event1_factor_r1_data,
-                                                                                        self.event0_code,
-                                                                                        [self.event1_code, self.event2_code],
-                                                                                        [1, self.event2_offset])
-        self.dual_reprate_table_r3_data = self.generate_sequence_factor_secondary_event(self.event0_frequency_r3_data,
-                                                                                        self.event1_factor_r3_data,
-                                                                                        self.event0_code,
-                                                                                        [self.event1_code, self.event2_code],
-                                                                                        [1, self.event2_offset])
+        self.dual_reprate_table_r1_data = self.generate_sequence_factor(self.event0_frequency_r1_data,
+                                                                        self.event1_factor_r1_data,
+                                                                        self.event0_code, self.event1_code)
+        self.dual_reprate_table_r3_data = self.generate_sequence_factor(self.event0_frequency_r3_data,
+                                                                        self.event1_factor_r3_data,
+                                                                        self.event0_code, self.event1_code)
         gpio.setmode(gpio.BOARD)
         gpio.setup(self.data_pins[0], gpio.OUT)
         gpio.setup(self.data_pins[1], gpio.OUT)
@@ -599,8 +595,8 @@ class ReprateDS(Device):
         max_f = f.max()
         ih = f.argmax()
         il = f.argmin()
-        fh = float(f[ih])           # High frequency
-        fl = float(f[il])           # Low frequency
+        fh = float(f[ih])
+        fl = float(f[il])
         fc, mc, kc = self.find_common(f[0], f[1], self.n_max)
         tp = 1 / fc / self.t0
         ep = 0x7f
@@ -661,53 +657,7 @@ class ReprateDS(Device):
         self.debug_stream("Generate sequence:\n {0}\n len {1}".format(inj_table, len(inj_table)))
         return inj_table
 
-    def generate_sequence_factor_secondary_event(self, f0, factor, event0, event1_list, event1_offset_list=None):
-        """
-        Generate injection table from event0 (higher frequency) and a divider factor to get f1=f0/factor
-        :param f0: Event0 freuqency
-        :type f0: float
-        :param factor: Divider
-        :type factor: int
-        :param event0: Event code for f0 e.g. 0xa0
-        :type event0: int
-        :param event1_list: List of event codes that should be emitted at the f0/factor frequency (i.e. once per table)
-        :type event1_list: list of ints
-        :param event1_offset_list: List of event timestamps for the event1 codes relative to the event0 timestamp
-        :type event1_offset_list: list of ints
-        :return: Injection table, list of lists:
-            [[timestamp0, event code0, enable0],
-             [timestamp1, event code1, enable1],
-             [timestamp2, event code2, enable2],
-             [timestamp3, event code3, enable3...]]
-        :rtype: List of lists of int
-        """
-        if f0 is None:
-            f0 = 2.0
-        if factor is None:
-            factor = 1
-        if event1_offset_list is None:
-            event1_offset_list = list(range(len(event1_list)))
-        f1 = np.double(f0) / factor
-        t_mrf = self.t0                 # MRF clock period
-        tp = [1 / f1 / t_mrf]           # Full cycle period in clocks
-        ep = [0x7f]                     # End sequence event code
-        t0_list = [ft / f0 / t_mrf + 1 for ft in range(factor)]                     # Minimum timestamp value = 1
-        t1_list = [2 + ev_off for ev_off in
-                   event1_offset_list]  # Next timestamp must be higher than the previous to activate
-        e0_list = [event0] * factor
-        es = np.array(e0_list + event1_list + ep).astype(int)
-        ts = np.array(t0_list + t1_list + tp).astype(int)
-        i_sort = ts.argsort()
-        t_offset = ts[i_sort[0]] - 1
-        ess = es[i_sort]
-        tss = ts[i_sort] - t_offset
-        inj_table = list()
-        for k, t in enumerate(tss):
-            inj_table.append([t, ess[k], 1])
-        self.debug_stream("Generate sequence:\n {0}\n len {1}".format(inj_table, len(inj_table)))
-        return inj_table
-
-    def configure_evr_outputevent(self, dev, output, event):
+    def configure_evr_outputevent(self, dev, output, event, do_init=True):
         """
         Set the output_init property of the event receiver so that output uses event
 
@@ -723,7 +673,8 @@ class ReprateDS(Device):
         output_s = "{0},{0},[{1}],0,-1".format(output, hex(event))
         output_list[output] = output_s
         dev.put_property({"Output_Init": output_list})
-        dev.command_inout("init")
+        if do_init:
+            dev.command_inout("init")
 
     def write_sequence_to_device(self, inj_table, ring, evr_event=0xa4):
         """
@@ -796,10 +747,16 @@ class ReprateDS(Device):
         # Set EVR listening event property
         if ring.lower() == "r1":
             self.configure_evr_outputevent(self.kicker_evr_device_r1, self.kicker_evr_name_r1.split("/")[-1], evr_event)
-            self.configure_evr_outputevent(self.chopper_evr_device_r1, self.chopper_evr_name_r1.split("/")[-1], evr_event)
+            self.configure_evr_outputevent(self.chopper_evr_device_r1, self.chopper_evr_name_r1.split("/")[-1],
+                                           evr_event, do_init=False)
+            self.configure_evr_outputevent(self.chopper_evr_device_r1, self.diag_evr_name_r1.split("/")[-1],
+                                           evr_event, do_init=True)
         else:
             self.configure_evr_outputevent(self.kicker_evr_device_r3, self.kicker_evr_name_r3.split("/")[-1], evr_event)
-            self.configure_evr_outputevent(self.chopper_evr_device_r3, self.chopper_evr_name_r3.split("/")[-1], evr_event)
+            self.configure_evr_outputevent(self.chopper_evr_device_r3, self.chopper_evr_name_r3.split("/")[-1],
+                                           evr_event, do_init=False)
+            self.configure_evr_outputevent(self.chopper_evr_device_r3, self.diag_evr_name_r3.split("/")[-1],
+                                           evr_event, do_init=True)
 
         # Set attributes
         try:
@@ -1026,10 +983,8 @@ class ReprateDS(Device):
         self.info_stream("Set event frequency R1: {0}".format(value))
         with self.data_lock:
             self.event0_frequency_r1_data = value
-            inj_table = self.generate_sequence_factor_secondary_event(value, self.event1_factor_r1_data,
-                                                                      self.event0_code,
-                                                                      [self.event1_code, self.event2_code],
-                                                                      [1, self.event2_offset])
+            inj_table = self.generate_sequence_factor(value, self.event1_factor_r1_data,
+                                                      self.event0_code, self.event1_code)
             self.dual_reprate_table_r1_data = inj_table
         self._gen_status()
         return True
@@ -1057,10 +1012,8 @@ class ReprateDS(Device):
         self.info_stream("Set event frequency R3: {0}".format(value))
         with self.data_lock:
             self.event0_frequency_r3_data = value
-            inj_table = self.generate_sequence_factor_secondary_event(value, self.event1_factor_r3_data,
-                                                                      self.event0_code,
-                                                                      [self.event1_code, self.event2_code],
-                                                                      [1, self.event2_offset])
+            inj_table = self.generate_sequence_factor(value, self.event1_factor_r3_data,
+                                                      self.event0_code, self.event1_code)
             self.dual_reprate_table_r3_data = inj_table
         self._gen_status()
         return True
@@ -1087,10 +1040,8 @@ class ReprateDS(Device):
         self.info_stream("Set event factor R1: {0}".format(value))
         with self.data_lock:
             self.event1_factor_r1_data = value
-            inj_table = self.generate_sequence_factor_secondary_event(self.event0_frequency_r1_data, value,
-                                                                      self.event0_code
-                                                                      [self.event1_code, self.event2_code],
-                                                                      [1, self.event2_offset])
+            inj_table = self.generate_sequence_factor(self.event0_frequency_r1_data, value,
+                                                      self.event0_code, self.event1_code)
             self.dual_reprate_table_r1_data = inj_table
         self._gen_status()
         return True
@@ -1117,10 +1068,8 @@ class ReprateDS(Device):
         self.info_stream("Set event factor R3: {0}".format(value))
         with self.data_lock:
             self.event1_factor_r3_data = value
-            inj_table = self.generate_sequence_factor_secondary_event(self.event0_frequency_r3_data, value,
-                                                                      self.event0_code
-                                                                      [self.event1_code, self.event2_code],
-                                                                      [1, self.event2_offset])
+            inj_table = self.generate_sequence_factor(self.event0_frequency_r3_data, value,
+                                                      self.event0_code, self.event1_code)
             self.dual_reprate_table_r3_data = inj_table
         self._gen_status()
         return True
